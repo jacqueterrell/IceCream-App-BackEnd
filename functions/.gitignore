@@ -8,3 +8,8 @@ typings/
 # Node.js dependency directory
 node_modules/
 *.local
+
+# Env files (API keys). Copy .env.example to .env and fill in values.
+.env
+.env.*
+!.env.example

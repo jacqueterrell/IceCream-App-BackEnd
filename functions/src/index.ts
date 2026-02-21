@@ -4,8 +4,11 @@
 
 import {onCall, onRequest, HttpsError} from "firebase-functions/v2/https";
 import {setGlobalOptions} from "firebase-functions";
+import {defineString} from "firebase-functions/params";
 import {getMessaging} from "firebase-admin/messaging";
 import * as admin from "firebase-admin";
+
+const googleMapsApiKey = defineString("GOOGLE_MAPS_API_KEY");
 
 if (!admin.apps.length) {
   admin.initializeApp();
@@ -176,11 +179,14 @@ interface DropoffRequestItem {
   phoneNumber: string;
   latitude: number;
   longitude: number;
+  /** Present when done (e.g. "Approved", "Canceled"). Omitted for pending. */
+  status?: string;
 }
 
 /**
- * Returns dropoff requests where done is not true.
- * Use from the app instead of reading Firestore (avoids rules/App Check).
+ * Returns dropoff requests: pending (done !== true) and approved
+ * (status === "Approved"). Use for map/route and ETA list.
+ * Admin list should filter to pending only.
  */
 export const getDropoffRequests =
   onCall<void, Promise<{requests: DropoffRequestItem[]}>>(async () => {
@@ -190,23 +196,29 @@ export const getDropoffRequests =
     const requests: DropoffRequestItem[] = [];
     snapshot.docs.forEach((doc) => {
       const d = doc.data();
-      if (d.done === true) return;
       const name = d.name;
       const phoneNumber = d.phoneNumber;
       const lat = d.latitude;
       const lng = d.longitude;
       if (
-        typeof name === "string" && typeof phoneNumber === "string" &&
-        typeof lat === "number" && typeof lng === "number"
+        typeof name !== "string" || typeof phoneNumber !== "string" ||
+        typeof lat !== "number" || typeof lng !== "number"
       ) {
-        requests.push({
-          id: doc.id,
-          name,
-          phoneNumber,
-          latitude: lat,
-          longitude: lng,
-        });
+        return;
       }
+      const done = d.done === true;
+      const status = d.status === "Approved" || d.status === "Canceled" ?
+        d.status as string :
+        undefined;
+      if (done && status !== "Approved") return;
+      requests.push({
+        id: doc.id,
+        name,
+        phoneNumber,
+        latitude: lat,
+        longitude: lng,
+        ...(status && {status}),
+      });
     });
     return {requests};
   });
@@ -277,6 +289,157 @@ export const markDropoffDone =
     return {success: true};
   });
 
+/** Request body for updateDropoffStatus */
+interface UpdateDropoffStatusData {
+  dropoffId: string;
+  status: "Approved" | "Canceled";
+}
+
+/**
+ * Updates a dropoff request with status Approved or Canceled.
+ * Call from Android when user taps Approve or Cancel.
+ */
+export const updateDropoffStatus =
+  onCall<
+    UpdateDropoffStatusData,
+    Promise<{success: boolean}>
+  >(async (request) => {
+    const data = request.data;
+    if (!data || typeof data !== "object" || !data.dropoffId) {
+      throw new HttpsError("invalid-argument", "dropoffId is required");
+    }
+    const dropoffId = String(data.dropoffId).trim();
+    if (!dropoffId) {
+      throw new HttpsError("invalid-argument", "dropoffId is required");
+    }
+    const status = data.status === "Canceled" ? "Canceled" : "Approved";
+    const db = admin.firestore();
+    await db.collection(DROPOFF_REQUESTS_COLLECTION).doc(dropoffId).update({
+      status,
+      done: true,
+      doneAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+    return {success: true};
+  });
+
+/** Request body for getOptimizedRoute. Origin = admin; waypoints = dropoffs. */
+interface GetOptimizedRouteData {
+  origin: {latitude: number; longitude: number};
+  waypoints: Array<{
+    id: string;
+    name: string;
+    latitude: number;
+    longitude: number;
+  }>;
+}
+
+/** Response: optimized order, leg durations (seconds), polyline for map. */
+interface OptimizedRouteResult {
+  waypointOrder: number[];
+  legDurationsSeconds: number[];
+  encodedPolyline: string;
+}
+
+const DIRECTIONS_LOG_PREFIX = "[getOptimizedRoute]";
+
+/**
+ * Returns an optimized route from origin through all waypoints (and back).
+ * Uses Google Directions API with waypoint optimization.
+ * Set GOOGLE_MAPS_API_KEY in config.
+ */
+export const getOptimizedRoute = onCall<
+  GetOptimizedRouteData,
+  Promise<OptimizedRouteResult>
+>(async (request) => {
+  const data = request.data;
+  const hasOrigin = data && typeof data === "object" && data.origin;
+  const hasWaypoints = Array.isArray(data?.waypoints);
+  if (!hasOrigin || !hasWaypoints) {
+    console.warn(
+      DIRECTIONS_LOG_PREFIX,
+      "Invalid request: origin and waypoints array required",
+    );
+    throw new HttpsError(
+      "invalid-argument",
+      "origin and waypoints array required",
+    );
+  }
+  const origin = data.origin as {latitude: number; longitude: number};
+  const waypoints = data.waypoints as GetOptimizedRouteData["waypoints"];
+  console.log(DIRECTIONS_LOG_PREFIX, "Request:", {
+    origin: `${origin.latitude},${origin.longitude}`,
+    waypointCount: waypoints.length,
+  });
+  if (waypoints.length === 0) {
+    console.log(DIRECTIONS_LOG_PREFIX, "No waypoints, returning empty result");
+    return {
+      waypointOrder: [],
+      legDurationsSeconds: [],
+      encodedPolyline: "",
+    };
+  }
+  const apiKey = googleMapsApiKey.value();
+  if (!apiKey) {
+    console.error(DIRECTIONS_LOG_PREFIX, "GOOGLE_MAPS_API_KEY not configured");
+    throw new HttpsError(
+      "failed-precondition",
+      "GOOGLE_MAPS_API_KEY not configured",
+    );
+  }
+  const o = `${origin.latitude},${origin.longitude}`;
+  const waypointsParam = "optimize:true|" +
+    waypoints.map((w) => `${w.latitude},${w.longitude}`).join("|");
+  const url = "https://maps.googleapis.com/maps/api/directions/json?" +
+    `origin=${encodeURIComponent(o)}&destination=${encodeURIComponent(o)}` +
+    `&waypoints=${encodeURIComponent(waypointsParam)}&key=${apiKey}`;
+  console.log(
+    DIRECTIONS_LOG_PREFIX,
+    "Calling Directions API (origin/dest same, optimize:true)",
+  );
+  const res = await fetch(url);
+  const json = await res.json() as {
+    status?: string;
+    error_message?: string;
+    routes?: Array<{
+      legs?: Array<{duration?: {value: number}}>;
+      overview_polyline?: {points?: string};
+      waypoint_order?: number[];
+    }>;
+  };
+  const status = json.status;
+  const errorMessage = json.error_message;
+  const firstRoute = json.routes?.[0];
+  if (status !== "OK" || !firstRoute) {
+    const detail = errorMessage ?
+      `${status}: ${errorMessage}` :
+      (status || "no route");
+    console.error(DIRECTIONS_LOG_PREFIX, "Directions API error:", detail);
+    throw new HttpsError(
+      "internal",
+      "Directions API error: " + detail,
+    );
+  }
+  const legs = firstRoute.legs || [];
+  const rawWaypointOrder = firstRoute.waypoint_order || [];
+  const rawLegDurations = legs
+    .slice(0, waypoints.length)
+    .map((leg) => leg.duration?.value ?? 0);
+  const len = Math.min(rawWaypointOrder.length, rawLegDurations.length);
+  const waypointOrder = rawWaypointOrder.slice(0, len);
+  const legDurationsSeconds = rawLegDurations.slice(0, len);
+  const encodedPolyline = firstRoute.overview_polyline?.points ?? "";
+  console.log(DIRECTIONS_LOG_PREFIX, "Directions API OK:", {
+    waypointOrderLength: waypointOrder.length,
+    legDurationsLength: legDurationsSeconds.length,
+    polylineLength: encodedPolyline.length,
+  });
+  return {
+    waypointOrder,
+    legDurationsSeconds,
+    encodedPolyline,
+  };
+});
+
 /** Optional secret for sendPushNotification. Set NOTIFY_SECRET in config. */
 const NOTIFY_SECRET = process.env.NOTIFY_SECRET || "";
 
@@ -341,9 +504,9 @@ export const sendPushNotification = onRequest(
           android,
           apns,
         });
-      } else {
+      } else if (topic) {
         await getMessaging().send({
-          topic: topic!,
+          topic,
           notification,
           android,
           apns,
