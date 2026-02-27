@@ -40,3 +40,13 @@ If the same key is used by the mobile apps and it’s set to “Android apps” 
     [Enable Directions API](https://console.cloud.google.com/apis/library/directions-backend.googleapis.com).
 - **Billing** is enabled for the project: [Billing](https://console.cloud.google.com/billing).
 - After changing the key or restrictions, wait a minute and redeploy: `firebase deploy --only functions`.
+
+## If iOS/Android show "Unable to load route" or "GOOGLE_MAPS_API_KEY not configured"
+
+The deployed function needs the API key at runtime:
+
+1. Ensure `functions/.env` contains `GOOGLE_MAPS_API_KEY=YourKey` (this file is gitignored).
+2. From the **project root** (e.g. `IceCream-App-BackEnd`), run:  
+   `firebase deploy --only functions`  
+   The CLI loads `functions/.env` when deploying; if it prompts for `GOOGLE_MAPS_API_KEY`, enter your key.
+3. After deploy, try the route again on the app. If the app still shows an error, the red message will now show the **exact** server error (e.g. "GOOGLE_MAPS_API_KEY not configured" or "Directions API error: ...") so you can fix it.

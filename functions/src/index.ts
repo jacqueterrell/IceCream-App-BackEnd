@@ -324,12 +324,11 @@ export const updateDropoffStatus =
 
 /** Request body for getOptimizedRoute. Origin = admin; waypoints = dropoffs. */
 interface GetOptimizedRouteData {
-  origin: {latitude: number; longitude: number};
-  waypoints: Array<{
-    id: string;
-    name: string;
-    latitude: number;
-    longitude: number;
+  origin?: {latitude?: number; longitude?: number};
+  waypoints?: Array<{
+    latitude?: number;
+    longitude?: number;
+    [key: string]: unknown;
   }>;
 }
 
@@ -341,6 +340,22 @@ interface OptimizedRouteResult {
 }
 
 const DIRECTIONS_LOG_PREFIX = "[getOptimizedRoute]";
+const MAX_WAYPOINTS = 25;
+
+/**
+ * Parses a value as a finite number (number or numeric string).
+ * Returns null if invalid.
+ * @param {unknown} v - Value to parse (number or string).
+ * @return {number|null} Finite number or null if invalid.
+ */
+function parseNum(v: unknown): number | null {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string") {
+    const n = Number(v);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
 
 /**
  * Returns an optimized route from origin through all waypoints (and back).
@@ -352,26 +367,50 @@ export const getOptimizedRoute = onCall<
   Promise<OptimizedRouteResult>
 >(async (request) => {
   const data = request.data;
-  const hasOrigin = data && typeof data === "object" && data.origin;
-  const hasWaypoints = Array.isArray(data?.waypoints);
-  if (!hasOrigin || !hasWaypoints) {
-    console.warn(
-      DIRECTIONS_LOG_PREFIX,
-      "Invalid request: origin and waypoints array required",
-    );
+  if (!data || typeof data !== "object") {
     throw new HttpsError(
       "invalid-argument",
-      "origin and waypoints array required",
+      "Request must include data object with origin and waypoints",
     );
   }
-  const origin = data.origin as {latitude: number; longitude: number};
-  const waypoints = data.waypoints as GetOptimizedRouteData["waypoints"];
+  const rawOrigin = data.origin;
+  const lat = parseNum(rawOrigin?.latitude);
+  const lng = parseNum(rawOrigin?.longitude);
+  if (lat == null || lng == null ||
+      lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    throw new HttpsError(
+      "invalid-argument",
+      "origin must have valid latitude and longitude (numbers in valid range)",
+    );
+  }
+  const origin = {latitude: lat, longitude: lng};
+
+  const rawWaypoints = Array.isArray(data.waypoints) ? data.waypoints : [];
+  const waypoints: Array<{latitude: number; longitude: number}> = [];
+  for (let i = 0; i < Math.min(rawWaypoints.length, MAX_WAYPOINTS); i++) {
+    const w = rawWaypoints[i] as Record<string, unknown> | undefined;
+    if (!w || typeof w !== "object") continue;
+    const wLat = parseNum(w.latitude);
+    const wLng = parseNum(w.longitude);
+    const validLat = wLat != null && wLat >= -90 && wLat <= 90;
+    const validLng = wLng != null && wLng >= -180 && wLng <= 180;
+    if (validLat && validLng) {
+      waypoints.push({latitude: wLat, longitude: wLng});
+    }
+  }
+  if (rawWaypoints.length > MAX_WAYPOINTS) {
+    console.warn(DIRECTIONS_LOG_PREFIX, "Waypoints capped at", MAX_WAYPOINTS);
+  }
+
   console.log(DIRECTIONS_LOG_PREFIX, "Request:", {
     origin: `${origin.latitude},${origin.longitude}`,
     waypointCount: waypoints.length,
   });
   if (waypoints.length === 0) {
-    console.log(DIRECTIONS_LOG_PREFIX, "No waypoints, returning empty result");
+    console.log(
+      DIRECTIONS_LOG_PREFIX,
+      "No valid waypoints, returning empty result",
+    );
     return {
       waypointOrder: [],
       legDurationsSeconds: [],
