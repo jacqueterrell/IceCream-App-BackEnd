@@ -2,12 +2,7 @@
  * Ice Cream App Backend – callable API for Android and iOS clients.
  */
 
-import {
-  onCall,
-  onRequest,
-  HttpsError,
-  type CallableRequest,
-} from "firebase-functions/v2/https";
+import {onCall, onRequest, HttpsError} from "firebase-functions/v2/https";
 import {setGlobalOptions} from "firebase-functions";
 import {defineString} from "firebase-functions/params";
 import {getMessaging} from "firebase-admin/messaging";
@@ -20,24 +15,6 @@ if (!admin.apps.length) {
 }
 
 setGlobalOptions({maxInstances: 10});
-
-/** Firebase Auth UID, or throws if the client is not signed in. */
-function requireAuthUid(request: CallableRequest): string {
-  const uid = request.auth?.uid;
-  if (!uid) {
-    throw new HttpsError("unauthenticated", "Sign-in required");
-  }
-  return uid;
-}
-
-/**
- * Vendors/admins see all dropoffs (until you add per-vendor filtering).
- * Set via Admin SDK, e.g. admin.auth().setCustomUserClaims(uid, {role: "vendor"}).
- */
-function isVendorOrAdmin(request: CallableRequest): boolean {
-  const role = request.auth?.token?.role;
-  return role === "vendor" || role === "admin";
-}
 
 /** Shape of a menu item returned by getIceCreamMenu */
 export interface IceCreamMenuItem {
@@ -209,17 +186,13 @@ interface DropoffRequestItem {
 /**
  * Returns dropoff requests: pending (done !== true) and approved
  * (status === "Approved"). Use for map/route and ETA list.
- * Signed-in users only see their own requests (userId).
- * Accounts with custom claim role "vendor" or "admin" see all requests.
+ * Admin list should filter to pending only.
  */
 export const getDropoffRequests =
-  onCall<void, Promise<{requests: DropoffRequestItem[]}>>(async (request) => {
-    const uid = requireAuthUid(request);
+  onCall<void, Promise<{requests: DropoffRequestItem[]}>>(async () => {
     const db = admin.firestore();
-    const col = db.collection(DROPOFF_REQUESTS_COLLECTION);
-    const snapshot = isVendorOrAdmin(request) ?
-      await col.get() :
-      await col.where("userId", "==", uid).get();
+    const snapshot =
+      await db.collection(DROPOFF_REQUESTS_COLLECTION).get();
     const requests: DropoffRequestItem[] = [];
     snapshot.docs.forEach((doc) => {
       const d = doc.data();
@@ -258,7 +231,6 @@ export const requestIceCreamDropoff = onCall<
   RequestIceCreamDropoffData,
   Promise<{success: boolean}>
 >(async (request) => {
-  const uid = requireAuthUid(request);
   const data = request.data;
   if (!data || typeof data !== "object") {
     throw new HttpsError("invalid-argument", "Missing request data");
@@ -281,7 +253,6 @@ export const requestIceCreamDropoff = onCall<
   }
   const db = admin.firestore();
   await db.collection(DROPOFF_REQUESTS_COLLECTION).add({
-    userId: uid,
     name,
     phoneNumber,
     latitude,
@@ -302,7 +273,6 @@ interface MarkDropoffDoneData {
  */
 export const markDropoffDone =
   onCall<MarkDropoffDoneData, Promise<{success: boolean}>>(async (request) => {
-    const uid = requireAuthUid(request);
     const data = request.data;
     if (!data || typeof data !== "object" || !data.dropoffId) {
       throw new HttpsError("invalid-argument", "dropoffId is required");
@@ -312,19 +282,7 @@ export const markDropoffDone =
       throw new HttpsError("invalid-argument", "dropoffId is required");
     }
     const db = admin.firestore();
-    const ref = db.collection(DROPOFF_REQUESTS_COLLECTION).doc(dropoffId);
-    const snap = await ref.get();
-    if (!snap.exists) {
-      throw new HttpsError("not-found", "Dropoff not found");
-    }
-    const ownerId = snap.get("userId");
-    const canAct =
-      isVendorOrAdmin(request) ||
-      (typeof ownerId === "string" && ownerId === uid);
-    if (!canAct) {
-      throw new HttpsError("permission-denied", "Not allowed");
-    }
-    await ref.update({
+    await db.collection(DROPOFF_REQUESTS_COLLECTION).doc(dropoffId).update({
       done: true,
       doneAt: admin.firestore.FieldValue.serverTimestamp(),
     });
@@ -346,13 +304,6 @@ export const updateDropoffStatus =
     UpdateDropoffStatusData,
     Promise<{success: boolean}>
   >(async (request) => {
-    requireAuthUid(request);
-    if (!isVendorOrAdmin(request)) {
-      throw new HttpsError(
-        "permission-denied",
-        "Only vendor or admin can update status",
-      );
-    }
     const data = request.data;
     if (!data || typeof data !== "object" || !data.dropoffId) {
       throw new HttpsError("invalid-argument", "dropoffId is required");
@@ -363,12 +314,7 @@ export const updateDropoffStatus =
     }
     const status = data.status === "Canceled" ? "Canceled" : "Approved";
     const db = admin.firestore();
-    const ref = db.collection(DROPOFF_REQUESTS_COLLECTION).doc(dropoffId);
-    const snap = await ref.get();
-    if (!snap.exists) {
-      throw new HttpsError("not-found", "Dropoff not found");
-    }
-    await ref.update({
+    await db.collection(DROPOFF_REQUESTS_COLLECTION).doc(dropoffId).update({
       status,
       done: true,
       doneAt: admin.firestore.FieldValue.serverTimestamp(),
