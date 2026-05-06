@@ -176,6 +176,7 @@ export const sendTestNotification = onCall<
 interface RegisterDeviceTokenData {
   fcmToken: string;
   platform: "android" | "ios";
+  receivesVendorAlerts?: boolean;
 }
 
 const DEVICE_TOKENS_COLLECTION = "deviceTokens";
@@ -189,6 +190,7 @@ export const registerDeviceToken =
     RegisterDeviceTokenData,
     Promise<{success: boolean}>
   >(async (request) => {
+    const uid = requireAuthUid(request);
     const data = request.data;
     if (!data || typeof data !== "object" || !data.fcmToken) {
       throw new HttpsError("invalid-argument", "fcmToken is required");
@@ -198,12 +200,15 @@ export const registerDeviceToken =
     if (!fcmToken) {
       throw new HttpsError("invalid-argument", "fcmToken is required");
     }
+    const receivesVendorAlerts = Boolean(data.receivesVendorAlerts);
     const db = admin.firestore();
     const docId =
       fcmToken.replace(/[^a-zA-Z0-9-]/g, "_").slice(0, 150) || "unknown";
     await db.collection(DEVICE_TOKENS_COLLECTION).doc(docId).set({
       fcmToken,
       platform,
+      userId: uid,
+      receivesVendorAlerts,
       updatedAt: admin.firestore.FieldValue.serverTimestamp(),
     }, {merge: true});
     return {success: true};
@@ -271,7 +276,20 @@ export const getDropoffRequests = onCall<
     const status = d.status === "Approved" || d.status === "Canceled" ?
       d.status as string :
       undefined;
-    if (done && status !== "Approved") return;
+    // e.g. markDropoffDone with no Approved/Canceled
+    if (done && !status) {
+      return;
+    }
+    // Vendor map/list: omit canceled pins; owner's own query still needs Canceled below
+    if (seeAll && done && status === "Canceled") {
+      return;
+    }
+    if (
+      done && status &&
+      status !== "Approved" && status !== "Canceled"
+    ) {
+      return;
+    }
     requests.push({
       id: doc.id,
       name,
@@ -375,6 +393,56 @@ interface UpdateDropoffStatusData {
 }
 
 /**
+ * Notifies registered device token(s) for the requester after admin cancels their dropoff.
+ * @param {string} requesterUid Firestore dropoffRequests.userId (Firebase Auth UID).
+ */
+async function notifyRequesterOfCanceledDropoff(requesterUid: string):
+  Promise<void> {
+  if (!requesterUid) return;
+  const db = admin.firestore();
+  const tokensSnap = await db.collection(DEVICE_TOKENS_COLLECTION)
+    .where("userId", "==", requesterUid)
+    .get();
+  const tokens: string[] = [];
+  tokensSnap.docs.forEach((doc) => {
+    const t = doc.get("fcmToken");
+    if (typeof t === "string" && t.trim()) {
+      tokens.push(t.trim());
+    }
+  });
+  if (tokens.length === 0) {
+    console.log(
+      "notifyRequesterOfCanceledDropoff: no device tokens for user",
+      requesterUid,
+    );
+    return;
+  }
+  const title = "Ice cream request canceled";
+  const body = "Your ice cream request was cancelled.";
+  try {
+    await getMessaging().sendEachForMulticast({
+      tokens,
+      notification: {title, body},
+      android: {priority: "high"},
+      apns: {
+        headers: {
+          "apns-push-type": "alert",
+          "apns-priority": "10",
+        },
+        payload: {
+          aps: {
+            sound: "default",
+            alert: {title, body},
+          },
+        },
+      },
+    });
+  } catch (e) {
+    console.error("notifyRequesterOfCanceledDropoff", e);
+  }
+}
+
+/**
  * Updates a dropoff request with status Approved or Canceled.
  * Call from Android when user taps Approve or Cancel.
  */
@@ -405,11 +473,18 @@ export const updateDropoffStatus =
     if (!snap.exists) {
       throw new HttpsError("not-found", "Dropoff not found");
     }
+    const requesterUid =
+      typeof snap.get("userId") === "string" ?
+        (snap.get("userId") as string) :
+        "";
     await ref.update({
       status,
       done: true,
       doneAt: admin.firestore.FieldValue.serverTimestamp(),
     });
+    if (status === "Canceled" && requesterUid) {
+      await notifyRequesterOfCanceledDropoff(requesterUid);
+    }
     return {success: true};
   });
 
