@@ -234,6 +234,8 @@ interface DropoffRequestItem {
   longitude: number;
   /** Present when done (e.g. "Approved", "Canceled"). Omitted for pending. */
   status?: string;
+  /** Unix epoch milliseconds when the request was created. */
+  createdAtMs?: number;
 }
 
 /**
@@ -280,7 +282,7 @@ export const getDropoffRequests = onCall<
     if (done && !status) {
       return;
     }
-    // Vendor map/list: omit canceled pins; owner's own query still needs Canceled below
+    // Vendor map: omit canceled pins; owner query still needs Canceled below
     if (seeAll && done && status === "Canceled") {
       return;
     }
@@ -290,6 +292,10 @@ export const getDropoffRequests = onCall<
     ) {
       return;
     }
+    const createdAtMs =
+      typeof d.createdAt?.toMillis === "function" ?
+        (d.createdAt.toMillis() as number) :
+        undefined;
     requests.push({
       id: doc.id,
       name,
@@ -297,14 +303,52 @@ export const getDropoffRequests = onCall<
       latitude: lat,
       longitude: lng,
       ...(status && {status}),
+      ...(createdAtMs !== undefined && {createdAtMs}),
     });
   });
   return {requests};
 });
 
+/** FCM topic all vendor/admin devices subscribe to for new-request alerts. */
+const VENDOR_ALERTS_TOPIC = "vendor-alerts";
+
+/**
+ * Sends a push notification to the vendor-alerts topic so every vendor/admin
+ * device is alerted immediately when a new dropoff request arrives.
+ * @param {string} requesterName Display name from the request.
+ */
+async function notifyVendorsOfNewRequest(requesterName: string): Promise<void> {
+  const title = "New ice cream request";
+  const body = `${requesterName} is requesting a delivery.`;
+  try {
+    await getMessaging().send({
+      topic: VENDOR_ALERTS_TOPIC,
+      notification: {title, body},
+      android: {priority: "high"},
+      apns: {
+        headers: {
+          "apns-push-type": "alert",
+          "apns-priority": "10",
+        },
+        payload: {
+          aps: {
+            sound: "default",
+            alert: {title, body},
+          },
+        },
+      },
+    });
+    console.log(
+      "notifyVendorsOfNewRequest: sent to topic", VENDOR_ALERTS_TOPIC,
+    );
+  } catch (e) {
+    console.error("notifyVendorsOfNewRequest: failed", e);
+  }
+}
+
 /**
  * Submits an ice cream dropoff request with name, phone, and coordinates.
- * Persists to Firestore (collection: dropoffRequests).
+ * Persists to Firestore and notifies vendor devices via FCM topic.
  */
 export const requestIceCreamDropoff = onCall<
   RequestIceCreamDropoffData,
@@ -341,6 +385,8 @@ export const requestIceCreamDropoff = onCall<
     done: false,
     createdAt: admin.firestore.FieldValue.serverTimestamp(),
   });
+  // Firestore write committed; notify vendors (non-fatal if this fails).
+  await notifyVendorsOfNewRequest(name);
   return {success: true};
 });
 
@@ -393,11 +439,14 @@ interface UpdateDropoffStatusData {
 }
 
 /**
- * Notifies registered device token(s) for the requester after admin cancels their dropoff.
- * @param {string} requesterUid Firestore dropoffRequests.userId (Firebase Auth UID).
+ * Notifies the requester's device tokens after admin updates dropoff status.
+ * @param {string} requesterUid UID of the user who made the request.
+ * @param {string} kind "canceled" or "approved".
  */
-async function notifyRequesterOfCanceledDropoff(requesterUid: string):
-  Promise<void> {
+async function notifyRequesterDropoffStatus(
+  requesterUid: string,
+  kind: "canceled" | "approved",
+): Promise<void> {
   if (!requesterUid) return;
   const db = admin.firestore();
   const tokensSnap = await db.collection(DEVICE_TOKENS_COLLECTION)
@@ -412,13 +461,18 @@ async function notifyRequesterOfCanceledDropoff(requesterUid: string):
   });
   if (tokens.length === 0) {
     console.log(
-      "notifyRequesterOfCanceledDropoff: no device tokens for user",
+      "notifyRequesterDropoffStatus: no device tokens for user",
       requesterUid,
+      kind,
     );
     return;
   }
-  const title = "Ice cream request canceled";
-  const body = "Your ice cream request was cancelled.";
+  const title = kind === "canceled" ?
+    "Ice cream request canceled" :
+    "Ice cream request approved";
+  const body = kind === "canceled" ?
+    "Your ice cream request was cancelled." :
+    "Your ice cream request was approved.";
   try {
     await getMessaging().sendEachForMulticast({
       tokens,
@@ -438,7 +492,7 @@ async function notifyRequesterOfCanceledDropoff(requesterUid: string):
       },
     });
   } catch (e) {
-    console.error("notifyRequesterOfCanceledDropoff", e);
+    console.error("notifyRequesterDropoffStatus", kind, e);
   }
 }
 
@@ -483,10 +537,71 @@ export const updateDropoffStatus =
       doneAt: admin.firestore.FieldValue.serverTimestamp(),
     });
     if (status === "Canceled" && requesterUid) {
-      await notifyRequesterOfCanceledDropoff(requesterUid);
+      await notifyRequesterDropoffStatus(requesterUid, "canceled");
+    } else if (status === "Approved" && requesterUid) {
+      await notifyRequesterDropoffStatus(requesterUid, "approved");
     }
     return {success: true};
   });
+
+/** Request body for cancelOwnDropoffRequest */
+interface CancelOwnDropoffData {
+  dropoffId: string;
+}
+
+/**
+ * Lets a customer cancel their own pending dropoff request.
+ * Verifies the caller owns the document, marks it Canceled, then
+ * notifies all vendor devices via the vendor-alerts FCM topic.
+ */
+export const cancelOwnDropoffRequest = onCall<
+  CancelOwnDropoffData,
+  Promise<{success: boolean}>
+>(async (request) => {
+  const uid = requireAuthUid(request);
+  const data = request.data;
+  if (!data || !data.dropoffId) {
+    throw new HttpsError("invalid-argument", "dropoffId is required");
+  }
+  const dropoffId = String(data.dropoffId).trim();
+  const db = admin.firestore();
+  const ref = db.collection(DROPOFF_REQUESTS_COLLECTION).doc(dropoffId);
+  const snap = await ref.get();
+  if (!snap.exists) {
+    throw new HttpsError("not-found", "Dropoff not found");
+  }
+  const ownerUid = snap.get("userId");
+  if (ownerUid !== uid) {
+    throw new HttpsError(
+      "permission-denied",
+      "You can only cancel your own requests",
+    );
+  }
+  await ref.update({
+    status: "Canceled",
+    done: true,
+    doneAt: admin.firestore.FieldValue.serverTimestamp(),
+  });
+  // Notify vendor devices that the customer canceled.
+  const requesterName =
+    typeof snap.get("name") === "string" ? (snap.get("name") as string) : "A customer";
+  const title = "Request canceled";
+  const body = `${requesterName} has canceled their ice cream request.`;
+  try {
+    await getMessaging().send({
+      topic: VENDOR_ALERTS_TOPIC,
+      notification: {title, body},
+      android: {priority: "high"},
+      apns: {
+        headers: {"apns-push-type": "alert", "apns-priority": "10"},
+        payload: {aps: {sound: "default", alert: {title, body}}},
+      },
+    });
+  } catch (e) {
+    console.error("cancelOwnDropoffRequest: vendor notify failed", e);
+  }
+  return {success: true};
+});
 
 /** Request body for getOptimizedRoute. Origin = admin; waypoints = dropoffs. */
 interface GetOptimizedRouteData {
